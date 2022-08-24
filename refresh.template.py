@@ -478,37 +478,45 @@ def _get_files(compile_action):
             # You might be tempted to get the source files out of the action message listed (just) in aquery --output=text  output, but the message differs for external workspaces and tools. Plus paths with spaces are going to be hard because it's space delimited. You'd have to make even stronger assumptions than the -c.
                 # Concretely, the message usually has the form "action 'Compiling foo.cpp'"" -> foo.cpp. But it also has "action 'Compiling src/tools/launcher/dummy.cc [for tool]'" -> external/bazel_tools/src/tools/launcher/dummy.cc
                 # If we did ever go this route, you can join the output from aquery --output=text and --output=jsonproto by actionKey.
+    source_files = set()
+    headers = set()
+    if "swiftc" in compile_action.arguments:
+        for arg in compile_action.arguments:
+            if arg.endswith(".swift") and not arg.startswith("-"):
+                source_files.add(arg)
+    else:
+        if '-o' in compile_action.arguments: # GCC, pre -o case
+            source_index = compile_action.arguments.index('-o') - 1
+        else: # MSVC, post /C case
+            assert '/c' in compile_action.arguments, f"-o or /c, required for parsing sources in GCC or MSVC-formatted commands, respectively, not found in compile args: {compile_action.arguments}.\nPlease file an issue with this information!"
+            source_index = compile_action.arguments.index('/c') + 1
 
-    if '-o' in compile_action.arguments: # GCC, pre -o case
-        source_index = compile_action.arguments.index('-o') - 1
-    else: # MSVC, post /C case
-        assert '/c' in compile_action.arguments, f"-o or /c, required for parsing sources in GCC or MSVC-formatted commands, respectively, not found in compile args: {compile_action.arguments}.\nPlease file an issue with this information!"
-        source_index = compile_action.arguments.index('/c') + 1
+        source_file = compile_action.arguments[source_index]
+        SOURCE_EXTENSIONS = ('.c', '.cc', '.cpp', '.cxx', '.c++', '.C', '.m', '.mm', '.cu', '.cl', '.s', '.asm', '.S', ".swift")
+        assert source_file.endswith(SOURCE_EXTENSIONS), f"Source file candidate, {source_file}, seems to be wrong.\nSelected from {compile_action.arguments}.\nPlease file an issue with this information!"
 
-    source_file = compile_action.arguments[source_index]
-    SOURCE_EXTENSIONS = ('.c', '.cc', '.cpp', '.cxx', '.c++', '.C', '.m', '.mm', '.cu', '.cl', '.s', '.asm', '.S')
-    assert source_file.endswith(SOURCE_EXTENSIONS), f"Source file candidate, {source_file}, seems to be wrong.\nSelected from {compile_action.arguments}.\nPlease file an issue with this information!"
-
-    # Warn gently about missing files
-    file_exists = os.path.isfile(source_file)
-    if not file_exists:
-        if not _get_files.has_logged_missing_file_error: # Just log once; subsequent messages wouldn't add anything.
-            _get_files.has_logged_missing_file_error = True
-            print(f"""\033[0;33m>>> A source file you compile doesn't (yet) exist: {source_file}
-    It's probably a generated file, and you haven't yet run a build to generate it.
-    That's OK; your code doesn't even have to compile for this tool to work.
-    If you can, though, you might want to run a build of your code.
-        That way everything is generated, browsable and indexed for autocomplete.
-    However, if you have *already* built your code, and generated the missing file...
-        Please make sure you're supplying this tool with the same flags you use to build.
-        You can either use a refresh_compile_commands rule or the special -- syntax. Please see the README.
-        [Supplying flags normally won't work. That just causes this tool to be built with those flags.]
-    Continuing gracefully...\033[0m""",  file=sys.stderr)
+        # Warn gently about missing files
+        file_exists = os.path.isfile(source_file)
+        if not file_exists:
+            if not _get_files.has_logged_missing_file_error: # Just log once; subsequent messages wouldn't add anything.
+                _get_files.has_logged_missing_file_error = True
+                print(f"""\033[0;33m>>> A source file you compile doesn't (yet) exist: {source_file}
+        It's probably a generated file, and you haven't yet run a build to generate it.
+        That's OK; your code doesn't even have to compile for this tool to work.
+        If you can, though, you might want to run a build of your code.
+            That way everything is generated, browsable and indexed for autocomplete.
+        However, if you have *already* built your code, and generated the missing file...
+            Please make sure you're supplying this tool with the same flags you use to build.
+            You can either use a refresh_compile_commands rule or the special -- syntax. Please see the README.
+            [Supplying flags normally won't work. That just causes this tool to be built with those flags.]
+        Continuing gracefully...\033[0m""",  file=sys.stderr)
+        source_files.add(source_file)
+        headers = _get_headers(compile_action, source_file)
 
     # Note: We need to apply commands to headers and sources.
     # Why? clangd currently tries to infer commands for headers using files with similar paths. This often works really poorly for header-only libraries. The commands should instead have been inferred from the source files using those libraries... See https://github.com/clangd/clangd/issues/123 for more.
     # When that issue is resolved, we can stop looking for headers and just return the single source file.
-    return {source_file}, _get_headers(compile_action, source_file) if file_exists else set()
+    return source_files, headers
 _get_files.has_logged_missing_file_error = False
 
 
@@ -562,6 +570,15 @@ def _get_apple_active_clang():
     ).rstrip()
     # Unless xcode-select has been invoked (like for a beta) we'd expect, e.g., '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang' or '/Library/Developer/CommandLineTools/usr/bin/clang'.
 
+@functools.lru_cache(maxsize=None)
+def _get_apple_active_swift():
+    """Get path to xcode-select'd clang version."""
+    return subprocess.check_output(
+        ('xcrun', '--find', 'swift'),
+        stderr=subprocess.DEVNULL, # Suppress superfluous error messages like "Requested but did not find extension point with identifier..."
+        encoding=locale.getpreferredencoding()
+    ).rstrip()
+    # Unless xcode-select has been invoked (like for a beta) we'd expect, e.g., '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang' or '/Library/Developer/CommandLineTools/usr/bin/clang'.
 
 def _apple_platform_patch(compile_args: typing.List[str]):
     """De-Bazel the command into something clangd can parse.
@@ -575,7 +592,9 @@ def _apple_platform_patch(compile_args: typing.List[str]):
         # Undo Bazel's Apple platform compiler wrapping.
         # Bazel wraps the compiler as `external/local_config_cc/wrapped_clang` and exports that wrapped compiler in the proto. However, we need a clang call that clangd can introspect. (See notes in "how clangd uses compile_commands.json" in ImplementationReadme.md for more.)
         # Removing the wrapper is also important because Bazel's Xcode (but not CommandLineTools) wrapper crashes if you don't specify particular environment variables (replaced below). We'd need the wrapper to be invokable by clangd's --query-driver if we didn't remove the wrapper.
-        compile_args[0] = _get_apple_active_clang()
+        if compile_args[0].endswith("rules_swift/tools/worker/worker"):
+            compile_args.pop(0)
+            _patch_swift_args(compile_args)
 
         # We have to manually substitute out Bazel's macros so clang can parse the command
         # Code this mirrors is in https://github.com/bazelbuild/bazel/blob/master/tools/osx/crosstool/wrapped_clang.cc
@@ -588,6 +607,25 @@ def _apple_platform_patch(compile_args: typing.List[str]):
         assert apple_platform, f"Apple platform not detected in CMD: {compile_args}"
         compile_args = [arg.replace('__BAZEL_XCODE_SDKROOT__', _get_apple_SDKROOT(apple_platform)) for arg in compile_args]
 
+    return compile_args
+
+def _patch_swift_args(compile_args: typing.List[str]):
+    need_remove_indexs = []
+    index_store_path = ""
+    for index in range(len(compile_args) - 1):
+        arg = compile_args[index]
+        if arg.startswith('-Xwrapped-swift=-global-index-store-import-path='):
+            need_remove_indexs.append(index)
+            index_store_path = arg.removeprefix('-Xwrapped-swift=-global-index-store-import-path=')
+        elif arg.startswith('-Xwrapped-swift='):
+            need_remove_indexs.append(index)
+    need_remove_indexs.reverse()
+    for index in need_remove_indexs:
+        compile_args.pop(index)
+    for index in range(len(compile_args) - 1):
+        arg = compile_args[index]
+        if arg.startswith('-index-store-path'):
+            compile_args[index + 1] = index_store_path
     return compile_args
 
 
@@ -709,7 +747,7 @@ def _get_commands(target: str, flags: str):
         # Aquery docs if you need em: https://docs.bazel.build/versions/master/aquery.html
         # Aquery output proto reference: https://github.com/bazelbuild/bazel/blob/master/src/main/protobuf/analysis_v2.proto
         # One bummer, not described in the docs, is that aquery filters over *all* actions for a given target, rather than just those that would be run by a build to produce a given output. This mostly isn't a problem, but can sometimes surface extra, unnecessary, misconfigured actions. Chris has emailed the authors to discuss and filed an issue so anyone reading this could track it: https://github.com/bazelbuild/bazel/issues/14156.
-        f"mnemonic('(Objc|Cpp)Compile',deps({target}))",
+        f"mnemonic('(Objc|Cpp|Swift)Compile',deps({target}))",
         # We switched to jsonproto instead of proto because of https://github.com/bazelbuild/bazel/issues/13404. We could change back when fixed--reverting most of the commit that added this line and tweaking the build file to depend on the target in that issue. That said, it's kinda nice to be free of the dependency, unless (OPTIMNOTE) jsonproto becomes a performance bottleneck compated to binary protos.
         '--output=jsonproto',
         # We'll disable artifact output for efficiency, since it's large and we don't use them. Small win timewise, but dramatically less json output from aquery.
